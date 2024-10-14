@@ -21,6 +21,10 @@ ignore = [
     "CPY"
 ]
 
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ANN"]
+
+
 [tool.coverage.run]
 omit = [
     "tests/*",
