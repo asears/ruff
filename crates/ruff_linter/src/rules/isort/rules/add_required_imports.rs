@@ -1,16 +1,15 @@
 use ruff_diagnostics::{AlwaysFixableViolation, Diagnostic, Fix};
-use ruff_macros::{derive_message_formats, violation};
+use ruff_macros::{derive_message_formats, ViolationMetadata};
 use ruff_python_ast::helpers::is_docstring_stmt;
 use ruff_python_ast::{self as ast, ModModule, PySourceType, Stmt};
 use ruff_python_codegen::Stylist;
 use ruff_python_parser::Parsed;
 use ruff_python_semantic::{FutureImport, NameImport};
-use ruff_source_file::Locator;
 use ruff_text_size::{TextRange, TextSize};
 
 use crate::importer::Importer;
-
 use crate::settings::LinterSettings;
+use crate::Locator;
 
 /// ## What it does
 /// Adds any required imports, as specified by the user, to the top of the
@@ -38,8 +37,8 @@ use crate::settings::LinterSettings;
 ///
 /// ## Options
 /// - `lint.isort.required-imports`
-#[violation]
-pub struct MissingRequiredImport(pub String);
+#[derive(ViolationMetadata)]
+pub(crate) struct MissingRequiredImport(pub String);
 
 impl AlwaysFixableViolation for MissingRequiredImport {
     #[derive_message_formats]

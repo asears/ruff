@@ -3,25 +3,29 @@
 #![allow(clippy::doc_markdown)]
 
 use std::cmp::Ordering;
+use std::sync::LazyLock;
 use std::{borrow::Cow, collections::VecDeque};
 
 use itertools::Itertools;
+use regex::Regex;
 
 use ruff_formatter::printer::SourceMapGeneration;
-use ruff_python_ast::{str::Quote, StringFlags};
+use ruff_python_ast::{str::Quote, AnyStringFlags, StringFlags};
 use ruff_python_trivia::CommentRanges;
-use {once_cell::sync::Lazy, regex::Regex};
 use {
     ruff_formatter::{write, FormatOptions, IndentStyle, LineWidth, Printed},
     ruff_python_trivia::{is_python_whitespace, PythonWhitespace},
-    ruff_source_file::Locator,
     ruff_text_size::{Ranged, TextLen, TextRange, TextSize},
 };
 
-use super::NormalizedString;
-use crate::preview::is_docstring_code_block_in_docstring_indent_enabled;
+use crate::preview::{
+    is_docstring_code_block_in_docstring_indent_enabled,
+    is_join_implicit_concatenated_string_enabled,
+};
 use crate::string::StringQuotes;
 use crate::{prelude::*, DocstringCodeLineWidth, FormatModuleError};
+
+use super::NormalizedString;
 
 /// Format a docstring by trimming whitespace and adjusting the indentation.
 ///
@@ -167,7 +171,7 @@ pub(crate) fn format(normalized: &NormalizedString, f: &mut PyFormatter) -> Form
     if docstring[first.len()..].trim().is_empty() {
         // For `"""\n"""` or other whitespace between the quotes, black keeps a single whitespace,
         // but `""""""` doesn't get one inserted.
-        if needs_chaperone_space(normalized, trim_end)
+        if needs_chaperone_space(normalized.flags(), trim_end, f.context())
             || (trim_end.is_empty() && !docstring.is_empty())
         {
             space().fmt(f)?;
@@ -207,7 +211,7 @@ pub(crate) fn format(normalized: &NormalizedString, f: &mut PyFormatter) -> Form
     let trim_end = docstring
         .as_ref()
         .trim_end_matches(|c: char| c.is_whitespace() && c != '\n');
-    if needs_chaperone_space(normalized, trim_end) {
+    if needs_chaperone_space(normalized.flags(), trim_end, f.context()) {
         space().fmt(f)?;
     }
 
@@ -263,7 +267,7 @@ struct DocstringLinePrinter<'ast, 'buf, 'fmt, 'src> {
     code_example: CodeExample<'src>,
 }
 
-impl<'ast, 'buf, 'fmt, 'src> DocstringLinePrinter<'ast, 'buf, 'fmt, 'src> {
+impl<'src> DocstringLinePrinter<'_, '_, '_, 'src> {
     /// Print all of the lines in the given iterator to this
     /// printer's formatter.
     ///
@@ -661,7 +665,7 @@ struct OutputDocstringLine<'src> {
     is_last: bool,
 }
 
-impl<'src> OutputDocstringLine<'src> {
+impl OutputDocstringLine<'_> {
     /// Return this reformatted line, but with the given function applied to
     /// the text of the line.
     fn map(self, mut map: impl FnMut(&str) -> String) -> OutputDocstringLine<'static> {
@@ -1022,7 +1026,7 @@ impl<'src> CodeExampleRst<'src> {
     ///
     /// [literal block]: https://docutils.sourceforge.io/docs/ref/rst/restructuredtext.html#literal-blocks
     /// [code block directive]: https://www.sphinx-doc.org/en/master/usage/restructuredtext/directives.html#directive-code-block
-    fn new(original: InputDocstringLine<'src>) -> Option<CodeExampleRst> {
+    fn new(original: InputDocstringLine<'src>) -> Option<CodeExampleRst<'src>> {
         let (opening_indent, rest) = indent_with_suffix(original.line);
         if rest.starts_with(".. ") {
             if let Some(litblock) = CodeExampleRst::new_code_block(original) {
@@ -1057,7 +1061,7 @@ impl<'src> CodeExampleRst<'src> {
     /// Attempts to create a new reStructuredText code example from a
     /// `code-block` or `sourcecode` directive. If one couldn't be found, then
     /// `None` is returned.
-    fn new_code_block(original: InputDocstringLine<'src>) -> Option<CodeExampleRst> {
+    fn new_code_block(original: InputDocstringLine<'src>) -> Option<CodeExampleRst<'src>> {
         // This regex attempts to parse the start of a reStructuredText code
         // block [directive]. From the reStructuredText spec:
         //
@@ -1075,7 +1079,7 @@ impl<'src> CodeExampleRst<'src> {
         // [directives]: https://docutils.sourceforge.io/docs/ref/rst/restructuredtext.html#directives
         // [Pygments lexer names]: https://pygments.org/docs/lexers/
         // [code-block]: https://www.sphinx-doc.org/en/master/usage/restructuredtext/directives.html#directive-code-block
-        static DIRECTIVE_START: Lazy<Regex> = Lazy::new(|| {
+        static DIRECTIVE_START: LazyLock<Regex> = LazyLock::new(|| {
             Regex::new(
                 r"(?m)^\s*\.\. \s*(?i:code-block|sourcecode)::\s*(?i:python|py|python3|py3)$",
             )
@@ -1320,7 +1324,7 @@ impl<'src> CodeExampleMarkdown<'src> {
     ///
     /// [fenced code block]: https://spec.commonmark.org/0.30/#fenced-code-blocks
     fn new(original: InputDocstringLine<'src>) -> Option<CodeExampleMarkdown<'src>> {
-        static FENCE_START: Lazy<Regex> = Lazy::new(|| {
+        static FENCE_START: LazyLock<Regex> = LazyLock::new(|| {
             Regex::new(
                 r"(?xm)
                 ^
@@ -1589,9 +1593,8 @@ fn docstring_format_source(
     let comment_ranges = CommentRanges::from(parsed.tokens());
     let source_code = ruff_formatter::SourceCode::new(source);
     let comments = crate::Comments::from_ast(parsed.syntax(), source_code, &comment_ranges);
-    let locator = Locator::new(source);
 
-    let ctx = PyFormatContext::new(options, locator.contents(), comments, parsed.tokens())
+    let ctx = PyFormatContext::new(options, source, comments, parsed.tokens())
         .in_docstring(docstring_quote_style);
     let formatted = crate::format!(ctx, [parsed.syntax().format()])?;
     formatted
@@ -1604,9 +1607,18 @@ fn docstring_format_source(
 /// If the last line of the docstring is `content" """` or `content\ """`, we need a chaperone space
 /// that avoids `content""""` and `content\"""`. This does only applies to un-escaped backslashes,
 /// so `content\\ """` doesn't need a space while `content\\\ """` does.
-fn needs_chaperone_space(normalized: &NormalizedString, trim_end: &str) -> bool {
-    trim_end.ends_with(normalized.flags().quote_style().as_char())
-        || trim_end.chars().rev().take_while(|c| *c == '\\').count() % 2 == 1
+pub(super) fn needs_chaperone_space(
+    flags: AnyStringFlags,
+    trim_end: &str,
+    context: &PyFormatContext,
+) -> bool {
+    if trim_end.chars().rev().take_while(|c| *c == '\\').count() % 2 == 1 {
+        true
+    } else if is_join_implicit_concatenated_string_enabled(context) {
+        flags.is_triple_quoted() && trim_end.ends_with(flags.quote_style().as_char())
+    } else {
+        trim_end.ends_with(flags.quote_style().as_char())
+    }
 }
 
 #[derive(Copy, Clone, Debug)]

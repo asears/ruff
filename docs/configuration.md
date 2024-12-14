@@ -47,8 +47,8 @@ If left unspecified, Ruff's default configuration is equivalent to:
     line-length = 88
     indent-width = 4
 
-    # Assume Python 3.8
-    target-version = "py38"
+    # Assume Python 3.9
+    target-version = "py39"
 
     [tool.ruff.lint]
     # Enable Pyflakes (`F`) and a subset of the pycodestyle (`E`)  codes by default.
@@ -129,8 +129,8 @@ If left unspecified, Ruff's default configuration is equivalent to:
     line-length = 88
     indent-width = 4
 
-    # Assume Python 3.8
-    target-version = "py38"
+    # Assume Python 3.9
+    target-version = "py39"
 
     [lint]
     # Enable Pyflakes (`F`) and a subset of the pycodestyle (`E`)  codes by default.
@@ -515,7 +515,7 @@ Ruff: An extremely fast Python linter and code formatter.
 Usage: ruff [OPTIONS] <COMMAND>
 
 Commands:
-  check    Run Ruff on the given files or directories (default)
+  check    Run Ruff on the given files or directories
   rule     Explain a rule (or all rules)
   config   List or describe the available configuration options
   linter   List all supported upstream linters
@@ -557,7 +557,7 @@ Or `ruff help check` for more on the linting command:
 <!-- Begin auto-generated check help. -->
 
 ```text
-Run Ruff on the given files or directories (default)
+Run Ruff on the given files or directories
 
 Usage: ruff check [OPTIONS] [FILES]...
 
@@ -589,7 +589,7 @@ Options:
           Ignore any `# noqa` comments
       --output-format <OUTPUT_FORMAT>
           Output serialization format for violations. The default serialization
-          format is "full" [env: RUFF_OUTPUT_FORMAT=] [possible values: text,
+          format is "full" [env: RUFF_OUTPUT_FORMAT=] [possible values:
           concise, full, json, json-lines, junit, grouped, github, gitlab,
           pylint, rdjson, azure, sarif]
   -o, --output-file <OUTPUT_FILE>

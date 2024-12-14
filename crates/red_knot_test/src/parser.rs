@@ -1,7 +1,16 @@
-use once_cell::sync::Lazy;
-use regex::{Captures, Regex};
-use ruff_index::{newtype_index, IndexVec};
+use std::sync::LazyLock;
+
+use anyhow::bail;
+use memchr::memchr2;
+use regex::{Captures, Match, Regex};
 use rustc_hash::{FxHashMap, FxHashSet};
+
+use ruff_index::{newtype_index, IndexVec};
+use ruff_python_trivia::Cursor;
+use ruff_source_file::LineRanges;
+use ruff_text_size::{TextLen, TextRange, TextSize};
+
+use crate::config::MarkdownTestConfig;
 
 /// Parse the Markdown `source` as a test suite with given `title`.
 pub(crate) fn parse<'s>(title: &'s str, source: &'s str) -> anyhow::Result<MarkdownTestSuite<'s>> {
@@ -64,6 +73,10 @@ impl<'m, 's> MarkdownTest<'m, 's> {
     pub(crate) fn files(&self) -> impl Iterator<Item = &'m EmbeddedFile<'s>> {
         self.files.iter()
     }
+
+    pub(crate) fn configuration(&self) -> &MarkdownTestConfig {
+        &self.section.config
+    }
 }
 
 /// Iterator yielding all [`MarkdownTest`]s in a [`MarkdownTestSuite`].
@@ -112,6 +125,7 @@ struct Section<'s> {
     title: &'s str,
     level: u8,
     parent_id: Option<SectionId>,
+    config: MarkdownTestConfig,
 }
 
 #[newtype_index]
@@ -131,17 +145,26 @@ pub(crate) struct EmbeddedFile<'s> {
     pub(crate) path: &'s str,
     pub(crate) lang: &'s str,
     pub(crate) code: &'s str,
+
+    /// The offset of the backticks beginning the code block within the markdown file
+    pub(crate) md_offset: TextSize,
 }
 
-/// Matches an arbitrary amount of whitespace (including newlines), followed by a sequence of `#`
-/// characters, followed by a title heading, followed by a newline.
-static HEADER_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^(\s*\n)*(?<level>#+)\s+(?<title>.+)\s*\n").unwrap());
+/// Matches a sequence of `#` characters, followed by a title heading, followed by a newline.
+static HEADER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(?<level>#+)\s+(?<title>.+)\s*\n").unwrap());
 
 /// Matches a code block fenced by triple backticks, possibly with language and `key=val`
 /// configuration items following the opening backticks (in the "tag string" of the code block).
-static CODE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"^```(?<lang>\w+)(?<config>( +\S+)*)\s*\n(?<code>(.|\n)*?)\n```\s*\n").unwrap()
+static CODE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?x)
+        ^```(?<lang>(?-u:\w)+)?(?<config>(?:\x20+\S+)*)\s*\n
+        (?<code>(?:.|\n)*?)\n?
+        (?<end>```|\z)
+        ",
+    )
+    .unwrap()
 });
 
 #[derive(Debug)]
@@ -166,7 +189,7 @@ impl SectionStack {
         popped
     }
 
-    fn parent(&mut self) -> SectionId {
+    fn top(&mut self) -> SectionId {
         *self
             .0
             .last()
@@ -184,13 +207,19 @@ struct Parser<'s> {
     files: IndexVec<EmbeddedFileId, EmbeddedFile<'s>>,
 
     /// The unparsed remainder of the Markdown source.
-    unparsed: &'s str,
+    cursor: Cursor<'s>,
+
+    source: &'s str,
+    source_len: TextSize,
 
     /// Stack of ancestor sections.
     stack: SectionStack,
 
     /// Names of embedded files in current active section.
     current_section_files: Option<FxHashSet<&'s str>>,
+
+    /// Whether or not the current section has a config block.
+    current_section_has_config: bool,
 }
 
 impl<'s> Parser<'s> {
@@ -200,13 +229,17 @@ impl<'s> Parser<'s> {
             title,
             level: 0,
             parent_id: None,
+            config: MarkdownTestConfig::default(),
         });
         Self {
             sections,
+            source,
             files: IndexVec::default(),
-            unparsed: source,
+            cursor: Cursor::new(source),
+            source_len: source.text_len(),
             stack: SectionStack::new(root_section_id),
             current_section_files: None,
+            current_section_has_config: false,
         }
     }
 
@@ -226,35 +259,61 @@ impl<'s> Parser<'s> {
     }
 
     fn parse_impl(&mut self) -> anyhow::Result<()> {
-        while !self.unparsed.is_empty() {
-            if let Some(captures) = self.scan(&HEADER_RE) {
-                self.parse_header(&captures)?;
-            } else if let Some(captures) = self.scan(&CODE_RE) {
-                self.parse_code_block(&captures)?;
-            } else {
-                // ignore other Markdown syntax (paragraphs, etc) used as comments in the test
-                if let Some(next_newline) = self.unparsed.find('\n') {
-                    (_, self.unparsed) = self.unparsed.split_at(next_newline + 1);
-                } else {
-                    break;
+        while let Some(position) = memchr2(b'`', b'#', self.cursor.as_bytes()) {
+            self.cursor.skip_bytes(position.saturating_sub(1));
+
+            // code blocks and headers must start on a new line.
+            if position == 0 || self.cursor.eat_char('\n') {
+                match self.cursor.first() {
+                    '#' => {
+                        if let Some(find) = HEADER_RE.find(self.cursor.as_str()) {
+                            self.parse_header(find.as_str())?;
+                            self.cursor.skip_bytes(find.len());
+                            continue;
+                        }
+                    }
+                    '`' => {
+                        if let Some(captures) = CODE_RE.captures(self.cursor.as_str()) {
+                            self.parse_code_block(&captures)?;
+                            self.cursor.skip_bytes(captures.get(0).unwrap().len());
+                            continue;
+                        }
+                    }
+                    _ => unreachable!(),
                 }
+            }
+
+            // Skip to the end of the line
+            if let Some(position) = memchr::memchr(b'\n', self.cursor.as_bytes()) {
+                self.cursor.skip_bytes(position);
+            } else {
+                break;
             }
         }
 
         Ok(())
     }
 
-    fn parse_header(&mut self, captures: &Captures<'s>) -> anyhow::Result<()> {
-        let header_level = captures["level"].len();
+    fn parse_header(&mut self, header: &'s str) -> anyhow::Result<()> {
+        let mut trimmed = header.trim();
+
+        let mut header_level = 0usize;
+        while let Some(rest) = trimmed.strip_prefix('#') {
+            header_level += 1;
+            trimmed = rest;
+        }
+
+        let title = trimmed.trim_start();
+
         self.pop_sections_to_level(header_level);
 
-        let parent = self.stack.parent();
+        let parent = self.stack.top();
 
         let section = Section {
-            // HEADER_RE can't match without a match for group 'title'.
-            title: captures.name("title").unwrap().into(),
+            title,
             level: header_level.try_into()?,
             parent_id: Some(parent),
+            config: self.sections[parent].config.clone(),
         };
 
         if self.current_section_files.is_some() {
@@ -269,13 +328,21 @@ impl<'s> Parser<'s> {
         self.stack.push(section_id);
 
         self.current_section_files = None;
+        self.current_section_has_config = false;
 
         Ok(())
     }
 
     fn parse_code_block(&mut self, captures: &Captures<'s>) -> anyhow::Result<()> {
         // We never pop the implicit root section.
-        let parent = self.stack.parent();
+        let section = self.stack.top();
+
+        if captures.name("end").unwrap().is_empty() {
+            let code_block_start = self.cursor.token_len();
+            let line = self.source.count_lines(TextRange::up_to(code_block_start)) + 1;
+
+            return Err(anyhow::anyhow!("Unterminated code block at line {line}."));
+        }
 
         let mut config: FxHashMap<&'s str, &'s str> = FxHashMap::default();
 
@@ -297,12 +364,26 @@ impl<'s> Parser<'s> {
 
         let path = config.get("path").copied().unwrap_or("test.py");
 
+        // CODE_RE can't match without matches for 'lang' and 'code'.
+        let lang = captures
+            .name("lang")
+            .as_ref()
+            .map(Match::as_str)
+            .unwrap_or_default();
+        let code = captures.name("code").unwrap().into();
+
+        if lang == "toml" {
+            return self.parse_config(code);
+        }
+
         self.files.push(EmbeddedFile {
             path,
-            section: parent,
-            // CODE_RE can't match without matches for 'lang' and 'code'.
-            lang: captures.name("lang").unwrap().into(),
-            code: captures.name("code").unwrap().into(),
+            section,
+            lang,
+
+            code,
+
+            md_offset: self.offset(),
         });
 
         if let Some(current_files) = &mut self.current_section_files {
@@ -312,12 +393,12 @@ impl<'s> Parser<'s> {
                         "Test `{}` has duplicate files named `{path}`. \
                                 (This is the default filename; \
                                  consider giving some files an explicit name with `path=...`.)",
-                        self.sections[parent].title
+                        self.sections[section].title
                     ));
                 }
                 return Err(anyhow::anyhow!(
                     "Test `{}` has duplicate files named `{path}`.",
-                    self.sections[parent].title
+                    self.sections[section].title
                 ));
             };
         } else {
@@ -327,8 +408,21 @@ impl<'s> Parser<'s> {
         Ok(())
     }
 
+    fn parse_config(&mut self, code: &str) -> anyhow::Result<()> {
+        if self.current_section_has_config {
+            bail!("Multiple TOML configuration blocks in the same section are not allowed.");
+        }
+
+        let current_section = &mut self.sections[self.stack.top()];
+        current_section.config = MarkdownTestConfig::from_str(code)?;
+
+        self.current_section_has_config = true;
+
+        Ok(())
+    }
+
     fn pop_sections_to_level(&mut self, level: usize) {
-        while level <= self.sections[self.stack.parent()].level.into() {
+        while level <= self.sections[self.stack.top()].level.into() {
             self.stack.pop();
             // We would have errored before pushing a child section if there were files, so we know
             // no parent section can have files.
@@ -336,15 +430,9 @@ impl<'s> Parser<'s> {
         }
     }
 
-    /// Get capture groups and advance cursor past match if unparsed text matches `pattern`.
-    fn scan(&mut self, pattern: &Regex) -> Option<Captures<'s>> {
-        if let Some(captures) = pattern.captures(self.unparsed) {
-            let (_, unparsed) = self.unparsed.split_at(captures.get(0).unwrap().end());
-            self.unparsed = unparsed;
-            Some(captures)
-        } else {
-            None
-        }
+    /// Retrieves the current offset of the cursor within the source code.
+    fn offset(&self) -> TextSize {
+        self.source_len - self.cursor.text_len()
     }
 }
 
@@ -367,6 +455,31 @@ mod tests {
             x = 1
             ```
             ",
+        );
+        let mf = super::parse("file.md", &source).unwrap();
+
+        let [test] = &mf.tests().collect::<Vec<_>>()[..] else {
+            panic!("expected one test");
+        };
+
+        assert_eq!(test.name(), "file.md");
+
+        let [file] = test.files().collect::<Vec<_>>()[..] else {
+            panic!("expected one file");
+        };
+
+        assert_eq!(file.path, "test.py");
+        assert_eq!(file.lang, "py");
+        assert_eq!(file.code, "x = 1");
+    }
+
+    #[test]
+    fn no_new_line_at_eof() {
+        let source = dedent(
+            "
+            ```py
+            x = 1
+            ```",
         );
         let mf = super::parse("file.md", &source).unwrap();
 
@@ -429,6 +542,57 @@ mod tests {
     }
 
     #[test]
+    fn multiple_file_tests() {
+        let source = dedent(
+            "
+            # One
+
+            ```py path=main.py
+            from foo import y
+            ```
+
+            ```py path=foo.py
+            y = 2
+            ```
+
+            # Two
+
+            ```py
+            y = 2
+            ```
+            ",
+        );
+        let mf = super::parse("file.md", &source).unwrap();
+
+        let [test1, test2] = &mf.tests().collect::<Vec<_>>()[..] else {
+            panic!("expected two tests");
+        };
+
+        assert_eq!(test1.name(), "file.md - One");
+        assert_eq!(test2.name(), "file.md - Two");
+
+        let [main, foo] = test1.files().collect::<Vec<_>>()[..] else {
+            panic!("expected two files");
+        };
+
+        assert_eq!(main.path, "main.py");
+        assert_eq!(main.lang, "py");
+        assert_eq!(main.code, "from foo import y");
+
+        assert_eq!(foo.path, "foo.py");
+        assert_eq!(foo.lang, "py");
+        assert_eq!(foo.code, "y = 2");
+
+        let [file] = test2.files().collect::<Vec<_>>()[..] else {
+            panic!("expected one file");
+        };
+
+        assert_eq!(file.path, "test.py");
+        assert_eq!(file.lang, "py");
+        assert_eq!(file.code, "y = 2");
+    }
+
+    #[test]
     fn custom_file_path() {
         let source = dedent(
             "
@@ -471,6 +635,81 @@ mod tests {
         };
 
         assert_eq!(file.code, "x = 1\ny = 2");
+    }
+
+    #[test]
+    fn empty_file() {
+        let source = dedent(
+            "
+            ```py
+            ```
+            ",
+        );
+
+        let mf = super::parse("file.md", &source).unwrap();
+
+        let [test] = &mf.tests().collect::<Vec<_>>()[..] else {
+            panic!("expected one test");
+        };
+        let [file] = test.files().collect::<Vec<_>>()[..] else {
+            panic!("expected one file");
+        };
+
+        assert_eq!(file.code, "");
+    }
+
+    #[test]
+    fn no_lang() {
+        let source = dedent(
+            "
+            ```
+            x = 10
+            ```
+            ",
+        );
+
+        let mf = super::parse("file.md", &source).unwrap();
+
+        let [test] = &mf.tests().collect::<Vec<_>>()[..] else {
+            panic!("expected one test");
+        };
+        let [file] = test.files().collect::<Vec<_>>()[..] else {
+            panic!("expected one file");
+        };
+
+        assert_eq!(file.code, "x = 10");
+    }
+
+    #[test]
+    fn unterminated_code_block_1() {
+        let source = dedent(
+            "
+            ```
+            x = 1
+            ",
+        );
+        let err = super::parse("file.md", &source).expect_err("Should fail to parse");
+        assert_eq!(err.to_string(), "Unterminated code block at line 2.");
+    }
+
+    #[test]
+    fn unterminated_code_block_2() {
+        let source = dedent(
+            "
+            ## A well-fenced block
+
+            ```
+            y = 2
+            ```
+
+            ## A not-so-well-fenced block
+
+            ```
+            x = 1
+            ",
+        );
+        let err = super::parse("file.md", &source).expect_err("Should fail to parse");
+        assert_eq!(err.to_string(), "Unterminated code block at line 10.");
     }
 
     #[test]

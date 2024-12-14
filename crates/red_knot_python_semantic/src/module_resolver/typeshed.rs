@@ -112,10 +112,10 @@ impl TypeshedVersions {
     pub(in crate::module_resolver) fn query_module(
         &self,
         module: &ModuleName,
-        target_version: PythonVersion,
+        python_version: PythonVersion,
     ) -> TypeshedVersionsQueryResult {
         if let Some(range) = self.exact(module) {
-            if range.contains(target_version) {
+            if range.contains(python_version) {
                 TypeshedVersionsQueryResult::Exists
             } else {
                 TypeshedVersionsQueryResult::DoesNotExist
@@ -125,7 +125,7 @@ impl TypeshedVersions {
             while let Some(module_to_try) = module {
                 if let Some(range) = self.exact(&module_to_try) {
                     return {
-                        if range.contains(target_version) {
+                        if range.contains(python_version) {
                             TypeshedVersionsQueryResult::MaybeExists
                         } else {
                             TypeshedVersionsQueryResult::DoesNotExist
@@ -459,11 +459,11 @@ foo: 3.8-   # trailing comment
 ";
         let parsed_versions = TypeshedVersions::from_str(VERSIONS).unwrap();
         assert_eq!(parsed_versions.len(), 3);
-        assert_snapshot!(parsed_versions.to_string(), @r###"
+        assert_snapshot!(parsed_versions.to_string(), @r"
         bar: 2.7-3.10
         bar.baz: 3.1-3.9
         foo: 3.8-
-        "###
+        "
         );
     }
 

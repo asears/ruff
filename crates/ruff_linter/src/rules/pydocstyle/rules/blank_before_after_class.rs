@@ -1,7 +1,7 @@
 use ruff_diagnostics::{AlwaysFixableViolation, Diagnostic, Edit, Fix};
-use ruff_macros::{derive_message_formats, violation};
+use ruff_macros::{derive_message_formats, ViolationMetadata};
 use ruff_python_trivia::{indentation_at_offset, PythonWhitespace};
-use ruff_source_file::{Line, UniversalNewlineIterator};
+use ruff_source_file::{Line, LineRanges, UniversalNewlineIterator};
 use ruff_text_size::Ranged;
 use ruff_text_size::{TextLen, TextRange};
 
@@ -42,13 +42,13 @@ use crate::registry::Rule;
 /// - `lint.pydocstyle.convention`
 ///
 /// [D211]: https://docs.astral.sh/ruff/rules/blank-line-before-class
-#[violation]
-pub struct OneBlankLineBeforeClass;
+#[derive(ViolationMetadata)]
+pub(crate) struct OneBlankLineBeforeClass;
 
 impl AlwaysFixableViolation for OneBlankLineBeforeClass {
     #[derive_message_formats]
     fn message(&self) -> String {
-        format!("1 blank line required before class docstring")
+        "1 blank line required before class docstring".to_string()
     }
 
     fn fix_title(&self) -> String {
@@ -65,8 +65,8 @@ impl AlwaysFixableViolation for OneBlankLineBeforeClass {
 /// docstring from its methods.
 ///
 /// This rule may not apply to all projects; its applicability is a matter of
-/// convention. By default, this rule is enabled when using the `google`
-/// convention, and disabled when using the `numpy` and `pep257` conventions.
+/// convention. By default, this rule is enabled when using the `numpy` and `pep257`
+/// conventions, and disabled when using the `google` convention.
 ///
 /// ## Example
 /// ```python
@@ -94,13 +94,13 @@ impl AlwaysFixableViolation for OneBlankLineBeforeClass {
 /// - [Google Python Style Guide - Docstrings](https://google.github.io/styleguide/pyguide.html#38-comments-and-docstrings)
 ///
 /// [PEP 257]: https://peps.python.org/pep-0257/
-#[violation]
-pub struct OneBlankLineAfterClass;
+#[derive(ViolationMetadata)]
+pub(crate) struct OneBlankLineAfterClass;
 
 impl AlwaysFixableViolation for OneBlankLineAfterClass {
     #[derive_message_formats]
     fn message(&self) -> String {
-        format!("1 blank line required after class docstring")
+        "1 blank line required after class docstring".to_string()
     }
 
     fn fix_title(&self) -> String {
@@ -141,13 +141,13 @@ impl AlwaysFixableViolation for OneBlankLineAfterClass {
 /// - `lint.pydocstyle.convention`
 ///
 /// [D203]: https://docs.astral.sh/ruff/rules/one-blank-line-before-class
-#[violation]
-pub struct BlankLineBeforeClass;
+#[derive(ViolationMetadata)]
+pub(crate) struct BlankLineBeforeClass;
 
 impl AlwaysFixableViolation for BlankLineBeforeClass {
     #[derive_message_formats]
     fn message(&self) -> String {
-        format!("No blank lines allowed before class docstring")
+        "No blank lines allowed before class docstring".to_string()
     }
 
     fn fix_title(&self) -> String {
@@ -240,7 +240,7 @@ pub(crate) fn blank_before_after_class(checker: &mut Checker, docstring: &Docstr
         if let Some(first_line) = &first_line {
             let trailing = first_line.as_str().trim_whitespace_start();
             if let Some(next_statement) = trailing.strip_prefix(';') {
-                let indentation = indentation_at_offset(docstring.start(), checker.locator())
+                let indentation = indentation_at_offset(docstring.start(), checker.source())
                     .expect("Own line docstring must have indentation");
                 let mut diagnostic = Diagnostic::new(OneBlankLineAfterClass, docstring.range());
                 let line_ending = checker.stylist().line_ending().as_str();

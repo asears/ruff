@@ -1,8 +1,8 @@
-use once_cell::sync::Lazy;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use ruff_diagnostics::{AlwaysFixableViolation, Diagnostic, Edit, Fix};
-use ruff_macros::{derive_message_formats, violation};
+use ruff_macros::{derive_message_formats, ViolationMetadata};
 use ruff_python_trivia::PythonWhitespace;
 use ruff_source_file::{UniversalNewlineIterator, UniversalNewlines};
 use ruff_text_size::Ranged;
@@ -37,8 +37,8 @@ use crate::registry::Rule;
 /// - [PEP 257 – Docstring Conventions](https://peps.python.org/pep-0257/)
 /// - [NumPy Style Guide](https://numpydoc.readthedocs.io/en/latest/format.html)
 /// - [Google Python Style Guide - Docstrings](https://google.github.io/styleguide/pyguide.html#38-comments-and-docstrings)
-#[violation]
-pub struct NoBlankLineBeforeFunction {
+#[derive(ViolationMetadata)]
+pub(crate) struct NoBlankLineBeforeFunction {
     num_lines: usize,
 }
 
@@ -81,8 +81,8 @@ impl AlwaysFixableViolation for NoBlankLineBeforeFunction {
 /// - [PEP 257 – Docstring Conventions](https://peps.python.org/pep-0257/)
 /// - [NumPy Style Guide](https://numpydoc.readthedocs.io/en/latest/format.html)
 /// - [Google Python Style Guide - Docstrings](https://google.github.io/styleguide/pyguide.html#38-comments-and-docstrings)
-#[violation]
-pub struct NoBlankLineAfterFunction {
+#[derive(ViolationMetadata)]
+pub(crate) struct NoBlankLineAfterFunction {
     num_lines: usize,
 }
 
@@ -98,8 +98,8 @@ impl AlwaysFixableViolation for NoBlankLineAfterFunction {
     }
 }
 
-static INNER_FUNCTION_OR_CLASS_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^\s+(?:(?:class|def|async def)\s|@)").unwrap());
+static INNER_FUNCTION_OR_CLASS_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s+(?:(?:class|def|async def)\s|@)").unwrap());
 
 /// D201, D202
 pub(crate) fn blank_before_after_function(checker: &mut Checker, docstring: &Docstring) {

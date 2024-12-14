@@ -1,12 +1,11 @@
-use crate::prelude::*;
-use crate::preview::{
-    is_f_string_formatting_enabled, is_f_string_implicit_concatenated_string_literal_quotes_enabled,
-};
-use crate::string::{Quoting, StringNormalizer, StringQuotes};
 use ruff_formatter::write;
 use ruff_python_ast::{AnyStringFlags, FString, StringFlags};
-use ruff_source_file::Locator;
+use ruff_source_file::LineRanges;
 use ruff_text_size::Ranged;
+
+use crate::prelude::*;
+use crate::preview::is_f_string_formatting_enabled;
+use crate::string::{Quoting, StringNormalizer, StringQuotes};
 
 use super::f_string_element::FormatFStringElement;
 
@@ -29,16 +28,13 @@ impl<'a> FormatFString<'a> {
 
 impl Format<PyFormatContext<'_>> for FormatFString<'_> {
     fn fmt(&self, f: &mut PyFormatter) -> FormatResult<()> {
-        let locator = f.context().locator();
-
         // If the preview style is enabled, make the decision on what quotes to use locally for each
         // f-string instead of globally for the entire f-string expression.
-        let quoting =
-            if is_f_string_implicit_concatenated_string_literal_quotes_enabled(f.context()) {
-                f_string_quoting(self.value, &locator)
-            } else {
-                self.quoting
-            };
+        let quoting = if is_f_string_formatting_enabled(f.context()) {
+            Quoting::CanChange
+        } else {
+            self.quoting
+        };
 
         let normalizer = StringNormalizer::from_context(f.context()).with_quoting(quoting);
 
@@ -69,21 +65,16 @@ impl Format<PyFormatContext<'_>> for FormatFString<'_> {
 
         let context = FStringContext::new(
             string_kind,
-            FStringLayout::from_f_string(self.value, &locator),
+            FStringLayout::from_f_string(self.value, f.context().source()),
         );
 
         // Starting prefix and quote
         let quotes = StringQuotes::from(string_kind);
         write!(f, [string_kind.prefix(), quotes])?;
 
-        f.join()
-            .entries(
-                self.value
-                    .elements
-                    .iter()
-                    .map(|element| FormatFStringElement::new(element, context)),
-            )
-            .finish()?;
+        for element in &self.value.elements {
+            FormatFStringElement::new(element, context).fmt(f)?;
+        }
 
         // Ending quote
         quotes.fmt(f)
@@ -92,17 +83,21 @@ impl Format<PyFormatContext<'_>> for FormatFString<'_> {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FStringContext {
-    flags: AnyStringFlags,
+    /// The string flags of the enclosing f-string part.
+    enclosing_flags: AnyStringFlags,
     layout: FStringLayout,
 }
 
 impl FStringContext {
-    const fn new(flags: AnyStringFlags, layout: FStringLayout) -> Self {
-        Self { flags, layout }
+    pub(crate) const fn new(flags: AnyStringFlags, layout: FStringLayout) -> Self {
+        Self {
+            enclosing_flags: flags,
+            layout,
+        }
     }
 
     pub(crate) fn flags(self) -> AnyStringFlags {
-        self.flags
+        self.enclosing_flags
     }
 
     pub(crate) const fn layout(self) -> FStringLayout {
@@ -121,7 +116,7 @@ pub(crate) enum FStringLayout {
 }
 
 impl FStringLayout {
-    fn from_f_string(f_string: &FString, locator: &Locator) -> Self {
+    pub(crate) fn from_f_string(f_string: &FString, source: &str) -> Self {
         // Heuristic: Allow breaking the f-string expressions across multiple lines
         // only if there already is at least one multiline expression. This puts the
         // control in the hands of the user to decide if they want to break the
@@ -137,7 +132,7 @@ impl FStringLayout {
         if f_string
             .elements
             .expressions()
-            .any(|expr| memchr::memchr2(b'\n', b'\r', locator.slice(expr).as_bytes()).is_some())
+            .any(|expr| source.contains_line_break(expr.range()))
         {
             Self::Multiline
         } else {
@@ -145,24 +140,11 @@ impl FStringLayout {
         }
     }
 
+    pub(crate) const fn is_flat(self) -> bool {
+        matches!(self, FStringLayout::Flat)
+    }
+
     pub(crate) const fn is_multiline(self) -> bool {
         matches!(self, FStringLayout::Multiline)
-    }
-}
-
-fn f_string_quoting(f_string: &FString, locator: &Locator) -> Quoting {
-    let triple_quoted = f_string.flags.is_triple_quoted();
-
-    if f_string.elements.expressions().any(|expression| {
-        let string_content = locator.slice(expression.range());
-        if triple_quoted {
-            string_content.contains(r#"""""#) || string_content.contains("'''")
-        } else {
-            string_content.contains(['"', '\''])
-        }
-    }) {
-        Quoting::Preserve
-    } else {
-        Quoting::CanChange
     }
 }

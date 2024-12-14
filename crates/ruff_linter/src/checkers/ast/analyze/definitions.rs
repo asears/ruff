@@ -1,10 +1,10 @@
 use ruff_python_ast::str::raw_contents_range;
-use ruff_text_size::{Ranged, TextRange};
-
 use ruff_python_semantic::all::DunderAllName;
 use ruff_python_semantic::{
     BindingKind, ContextualizedDefinition, Definition, Export, Member, MemberKind,
 };
+use ruff_source_file::LineRanges;
+use ruff_text_size::{Ranged, TextRange};
 
 use crate::checkers::ast::Checker;
 use crate::codes::Rule;
@@ -27,10 +27,8 @@ pub(crate) fn definitions(checker: &mut Checker) {
         Rule::MissingReturnTypeStaticMethod,
         Rule::MissingReturnTypeUndocumentedPublicFunction,
         Rule::MissingTypeArgs,
-        Rule::MissingTypeCls,
         Rule::MissingTypeFunctionArgument,
         Rule::MissingTypeKwargs,
-        Rule::MissingTypeSelf,
     ]);
     let enforce_stubs = checker.source_type.is_stub() && checker.enabled(Rule::DocstringInStub);
     let enforce_stubs_and_runtime = checker.enabled(Rule::IterMethodReturnIterable);
@@ -155,7 +153,7 @@ pub(crate) fn definitions(checker: &mut Checker) {
 
         // flake8-pyi
         if enforce_stubs {
-            flake8_pyi::rules::docstring_in_stubs(checker, docstring);
+            flake8_pyi::rules::docstring_in_stubs(checker, definition, docstring);
         }
         if enforce_stubs_and_runtime {
             flake8_pyi::rules::iter_method_return_iterable(checker, definition);

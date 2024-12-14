@@ -2,15 +2,16 @@ use anyhow::Result;
 
 use ast::whitespace::indentation;
 use ruff_diagnostics::{Diagnostic, Edit, Fix, FixAvailability, Violation};
-use ruff_macros::{derive_message_formats, violation};
+use ruff_macros::{derive_message_formats, ViolationMetadata};
 use ruff_python_ast::{self as ast, ElifElseClause, Stmt};
 use ruff_python_codegen::Stylist;
 use ruff_python_index::Indexer;
-use ruff_source_file::Locator;
+use ruff_source_file::LineRanges;
 use ruff_text_size::{Ranged, TextRange};
 
 use crate::checkers::ast::Checker;
 use crate::fix::edits::adjust_indentation;
+use crate::Locator;
 
 /// ## What it does
 /// Checks for `else` blocks that consist of a single `if` statement.
@@ -44,15 +45,15 @@ use crate::fix::edits::adjust_indentation;
 ///
 /// ## References
 /// - [Python documentation: `if` Statements](https://docs.python.org/3/tutorial/controlflow.html#if-statements)
-#[violation]
-pub struct CollapsibleElseIf;
+#[derive(ViolationMetadata)]
+pub(crate) struct CollapsibleElseIf;
 
 impl Violation for CollapsibleElseIf {
     const FIX_AVAILABILITY: FixAvailability = FixAvailability::Sometimes;
 
     #[derive_message_formats]
     fn message(&self) -> String {
-        format!("Use `elif` instead of `else` then `if`, to reduce indentation")
+        "Use `elif` instead of `else` then `if`, to reduce indentation".to_string()
     }
 
     fn fix_title(&self) -> Option<String> {
@@ -113,7 +114,7 @@ fn convert_to_elif(
     let trivia_range = TextRange::new(else_line_end, inner_if_line_start);
 
     // Identify the indentation of the outer clause
-    let Some(indentation) = indentation(locator, else_clause) else {
+    let Some(indentation) = indentation(locator.contents(), else_clause) else {
         return Err(anyhow::anyhow!("`else` is expected to be on its own line"));
     };
 

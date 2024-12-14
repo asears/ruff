@@ -321,7 +321,7 @@ fn site_packages_directory_from_sys_prefix(
     // the parsed version
     //
     // Note: the `python3.x` part of the `site-packages` path can't be computed from
-    // the `--target-version` the user has passed, as they might be running Python 3.12 locally
+    // the `--python-version` the user has passed, as they might be running Python 3.12 locally
     // even if they've requested that we type check their code "as if" they're running 3.8.
     for entry_result in system
         .read_directory(&sys_prefix_path.join("lib"))
@@ -732,7 +732,20 @@ mod tests {
         let system = TestSystem::default();
         assert!(matches!(
             VirtualEnvironment::new("/.venv", &system),
-            Err(SitePackagesDiscoveryError::VenvDirIsNotADirectory(_))
+            Err(SitePackagesDiscoveryError::VenvDirCanonicalizationError(..))
+        ));
+    }
+
+    #[test]
+    fn reject_venv_that_is_not_a_directory() {
+        let system = TestSystem::default();
+        system
+            .memory_file_system()
+            .write_file("/.venv", "")
+            .unwrap();
+        assert!(matches!(
+            VirtualEnvironment::new("/.venv", &system),
+            Err(SitePackagesDiscoveryError::VenvDirIsNotADirectory(..))
         ));
     }
 

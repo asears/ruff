@@ -347,9 +347,7 @@ impl Configuration {
                     .unwrap_or_default(),
                 flake8_pytest_style: lint
                     .flake8_pytest_style
-                    .map(|options| {
-                        Flake8PytestStyleOptions::try_into_settings(options, lint_preview)
-                    })
+                    .map(Flake8PytestStyleOptions::try_into_settings)
                     .transpose()?
                     .unwrap_or_default(),
                 flake8_quotes: lint
@@ -444,26 +442,6 @@ impl Configuration {
                 ..LintOptions::default()
             }
         };
-
-        #[allow(deprecated)]
-        if options.tab_size.is_some() {
-            let config_to_update = path.map_or_else(
-                || String::from("your `--config` CLI arguments"),
-                |path| format!("`{}`", fs::relativize_path(path)),
-            );
-            return Err(anyhow!("The `tab-size` option has been renamed to `indent-width` to emphasize that it configures the indentation used by the formatter as well as the tab width. Please update {config_to_update} to use `indent-width = <value>` instead."));
-        }
-
-        #[allow(deprecated)]
-        if options.output_format == Some(OutputFormat::Text) {
-            let config_to_update = path.map_or_else(
-                || String::from("your `--config` CLI arguments"),
-                |path| format!("`{}`", fs::relativize_path(path)),
-            );
-            return Err(anyhow!(
-                r#"The option `output_format=text` is no longer supported. Update {config_to_update} to use `output-format="concise"` or  `output-format="full"` instead."#
-            ));
-        }
 
         Ok(Self {
             builtins: options.builtins,
@@ -626,7 +604,6 @@ pub struct LintConfiguration {
     pub logger_objects: Option<Vec<String>>,
     pub task_tags: Option<Vec<String>>,
     pub typing_modules: Option<Vec<String>>,
-    pub allowed_unused_imports: Option<Vec<String>>,
 
     // Plugins
     pub flake8_annotations: Option<Flake8AnnotationsOptions>,
@@ -739,7 +716,7 @@ impl LintConfiguration {
             task_tags: options.common.task_tags,
             logger_objects: options.common.logger_objects,
             typing_modules: options.common.typing_modules,
-            allowed_unused_imports: options.common.allowed_unused_imports,
+
             // Plugins
             flake8_annotations: options.common.flake8_annotations,
             flake8_bandit: options.common.flake8_bandit,
@@ -798,6 +775,7 @@ impl LintConfiguration {
         let mut redirects = FxHashMap::default();
         let mut deprecated_selectors = FxHashSet::default();
         let mut removed_selectors = FxHashSet::default();
+        let mut removed_ignored_rules = FxHashSet::default();
         let mut ignored_preview_selectors = FxHashSet::default();
 
         // Track which docstring rules are specifically enabled
@@ -826,7 +804,7 @@ impl LintConfiguration {
                     .select
                     .iter()
                     .flatten()
-                    .chain(selection.extend_select.iter())
+                    .chain(&selection.extend_select)
                     .filter(|s| s.specificity() == spec)
                 {
                     for rule in selector.rules(&preview) {
@@ -853,7 +831,7 @@ impl LintConfiguration {
                     .fixable
                     .iter()
                     .flatten()
-                    .chain(selection.extend_fixable.iter())
+                    .chain(&selection.extend_fixable)
                     .filter(|s| s.specificity() == spec)
                 {
                     for rule in selector.all_rules() {
@@ -949,7 +927,11 @@ impl LintConfiguration {
                 // Removed rules
                 if selector.is_exact() {
                     if selector.all_rules().all(|rule| rule.is_removed()) {
-                        removed_selectors.insert(selector);
+                        if kind.is_disable() {
+                            removed_ignored_rules.insert(selector);
+                        } else {
+                            removed_selectors.insert(selector);
+                        }
                     }
                 }
 
@@ -991,6 +973,20 @@ impl LintConfiguration {
             }
         }
 
+        if !removed_ignored_rules.is_empty() {
+            let mut rules = String::new();
+            for selection in removed_ignored_rules.iter().sorted() {
+                let (prefix, code) = selection.prefix_and_code();
+                rules.push_str("\n    - ");
+                rules.push_str(prefix);
+                rules.push_str(code);
+            }
+            rules.push('\n');
+            warn_user_once_by_message!(
+                "The following rules have been removed and ignoring them has no effect:{rules}"
+            );
+        }
+
         for (from, target) in redirects.iter().sorted_by_key(|item| item.0) {
             // TODO(martin): This belongs into the ruff crate.
             warn_user_once_by_id!(
@@ -1004,13 +1000,9 @@ impl LintConfiguration {
         if preview.mode.is_disabled() {
             for selection in deprecated_selectors.iter().sorted() {
                 let (prefix, code) = selection.prefix_and_code();
-                let rule = format!("{prefix}{code}");
-                let mut message =
-                    format!("Rule `{rule}` is deprecated and will be removed in a future release.");
-                if matches!(rule.as_str(), "E999") {
-                    message.push_str(" Syntax errors will always be shown regardless of whether this rule is selected or not.");
-                }
-                warn_user_once_by_message!("{message}");
+                warn_user_once_by_message!(
+                    "Rule `{prefix}{code}` is deprecated and will be removed in a future release."
+                );
             }
         } else {
             let deprecated_selectors = deprecated_selectors.iter().sorted().collect::<Vec<_>>();
@@ -1108,9 +1100,7 @@ impl LintConfiguration {
                 .or(config.explicit_preview_rules),
             task_tags: self.task_tags.or(config.task_tags),
             typing_modules: self.typing_modules.or(config.typing_modules),
-            allowed_unused_imports: self
-                .allowed_unused_imports
-                .or(config.allowed_unused_imports),
+
             // Plugins
             flake8_annotations: self.flake8_annotations.combine(config.flake8_annotations),
             flake8_bandit: self.flake8_bandit.combine(config.flake8_bandit),
@@ -1332,7 +1322,6 @@ fn warn_about_deprecated_top_level_lint_options(
         explicit_preview_rules,
         task_tags,
         typing_modules,
-        allowed_unused_imports,
         unfixable,
         flake8_annotations,
         flake8_bandit,
@@ -1430,9 +1419,6 @@ fn warn_about_deprecated_top_level_lint_options(
 
     if typing_modules.is_some() {
         used_options.push("typing-modules");
-    }
-    if allowed_unused_imports.is_some() {
-        used_options.push("allowed-unused-imports");
     }
 
     if unfixable.is_some() {
@@ -1642,7 +1628,6 @@ mod tests {
             Rule::AmbiguousClassName,
             Rule::AmbiguousFunctionName,
             Rule::IOError,
-            Rule::SyntaxError,
             Rule::TabIndentation,
             Rule::TrailingWhitespace,
             Rule::MissingNewlineAtEndOfFile,
@@ -2058,11 +2043,11 @@ mod tests {
         assert_override(
             vec![
                 RuleSelection {
-                    select: Some(vec![d417.clone()]),
+                    select: Some(vec![d417]),
                     ..RuleSelection::default()
                 },
                 RuleSelection {
-                    extend_select: vec![d41.clone()],
+                    extend_select: vec![d41],
                     ..RuleSelection::default()
                 },
             ],

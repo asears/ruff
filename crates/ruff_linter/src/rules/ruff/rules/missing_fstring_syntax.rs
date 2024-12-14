@@ -1,18 +1,18 @@
+use memchr::memchr2_iter;
+use rustc_hash::FxHashSet;
+
 use ruff_diagnostics::{AlwaysFixableViolation, Diagnostic, Edit, Fix};
-use ruff_macros::{derive_message_formats, violation};
+use ruff_macros::{derive_message_formats, ViolationMetadata};
 use ruff_python_ast as ast;
 use ruff_python_literal::format::FormatSpec;
 use ruff_python_parser::parse_expression;
 use ruff_python_semantic::analyze::logging::is_logger_candidate;
 use ruff_python_semantic::{Modules, SemanticModel};
-use ruff_source_file::Locator;
 use ruff_text_size::{Ranged, TextRange};
-
-use memchr::memchr2_iter;
-use rustc_hash::FxHashSet;
 
 use crate::checkers::ast::Checker;
 use crate::rules::fastapi::rules::is_fastapi_route_call;
+use crate::Locator;
 
 /// ## What it does
 /// Searches for strings that look like they were meant to be f-strings, but are missing an `f` prefix.
@@ -55,13 +55,13 @@ use crate::rules::fastapi::rules::is_fastapi_route_call;
 /// [logging]: https://docs.python.org/3/howto/logging-cookbook.html#using-particular-formatting-styles-throughout-your-application
 /// [gettext]: https://docs.python.org/3/library/gettext.html
 /// [fastAPI path]: https://fastapi.tiangolo.com/tutorial/path-params/
-#[violation]
-pub struct MissingFStringSyntax;
+#[derive(ViolationMetadata)]
+pub(crate) struct MissingFStringSyntax;
 
 impl AlwaysFixableViolation for MissingFStringSyntax {
     #[derive_message_formats]
     fn message(&self) -> String {
-        format!(r"Possible f-string without an `f` prefix")
+        r"Possible f-string without an `f` prefix".to_string()
     }
 
     fn fix_title(&self) -> String {
@@ -189,12 +189,12 @@ fn should_be_fstring(
         .filter_map(ast::Expr::as_call_expr)
     {
         let ast::Arguments { keywords, args, .. } = &expr.arguments;
-        for keyword in &**keywords {
+        for keyword in keywords {
             if let Some(ident) = keyword.arg.as_ref() {
                 arg_names.insert(&ident.id);
             }
         }
-        for arg in &**args {
+        for arg in args {
             if let ast::Expr::Name(ast::ExprName { id, .. }) = arg {
                 arg_names.insert(id);
             }

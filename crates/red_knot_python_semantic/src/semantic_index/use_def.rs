@@ -47,7 +47,7 @@
 //! The **declared type** represents the code author's declaration (usually through a type
 //! annotation) that a given variable should not be assigned any type outside the declared type. In
 //! our model, declared types are also control-flow-sensitive; we allow the code author to
-//! explicitly re-declare the same variable with a different type. So for a given binding of a
+//! explicitly redeclare the same variable with a different type. So for a given binding of a
 //! variable, we will want to ask which declarations of that variable can reach that binding, in
 //! order to determine whether the binding is permitted, or should be a type error. For example:
 //!
@@ -62,7 +62,7 @@
 //! assignable to `str`. This is the purpose of declared types: they prevent accidental assignment
 //! of the wrong type to a variable.
 //!
-//! But in some cases it is useful to "shadow" or "re-declare" a variable with a new type, and we
+//! But in some cases it is useful to "shadow" or "redeclare" a variable with a new type, and we
 //! permit this, as long as it is done with an explicit re-annotation. So `path: Path =
 //! Path(path)`, with the explicit `: Path` annotation, is permitted.
 //!
@@ -228,6 +228,7 @@ use self::symbol_state::{
 use crate::semantic_index::ast_ids::ScopedUseId;
 use crate::semantic_index::definition::Definition;
 use crate::semantic_index::symbol::ScopedSymbolId;
+use crate::symbol::Boundness;
 use ruff_index::IndexVec;
 use rustc_hash::FxHashMap;
 
@@ -274,8 +275,12 @@ impl<'db> UseDefMap<'db> {
         self.bindings_iterator(&self.bindings_by_use[use_id])
     }
 
-    pub(crate) fn use_may_be_unbound(&self, use_id: ScopedUseId) -> bool {
-        self.bindings_by_use[use_id].may_be_unbound()
+    pub(crate) fn use_boundness(&self, use_id: ScopedUseId) -> Boundness {
+        if self.bindings_by_use[use_id].may_be_unbound() {
+            Boundness::PossiblyUnbound
+        } else {
+            Boundness::Bound
+        }
     }
 
     pub(crate) fn public_bindings(
@@ -285,8 +290,12 @@ impl<'db> UseDefMap<'db> {
         self.bindings_iterator(self.public_symbols[symbol].bindings())
     }
 
-    pub(crate) fn public_may_be_unbound(&self, symbol: ScopedSymbolId) -> bool {
-        self.public_symbols[symbol].may_be_unbound()
+    pub(crate) fn public_boundness(&self, symbol: ScopedSymbolId) -> Boundness {
+        if self.public_symbols[symbol].may_be_unbound() {
+            Boundness::PossiblyUnbound
+        } else {
+            Boundness::Bound
+        }
     }
 
     pub(crate) fn bindings_at_declaration(
@@ -391,7 +400,7 @@ pub(crate) struct ConstraintsIterator<'map, 'db> {
     constraint_ids: ConstraintIdIterator<'map>,
 }
 
-impl<'map, 'db> Iterator for ConstraintsIterator<'map, 'db> {
+impl<'db> Iterator for ConstraintsIterator<'_, 'db> {
     type Item = Constraint<'db>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -415,7 +424,7 @@ impl DeclarationsIterator<'_, '_> {
     }
 }
 
-impl<'map, 'db> Iterator for DeclarationsIterator<'map, 'db> {
+impl<'db> Iterator for DeclarationsIterator<'_, 'db> {
     type Item = Definition<'db>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -450,10 +459,6 @@ pub(super) struct UseDefMapBuilder<'db> {
 }
 
 impl<'db> UseDefMapBuilder<'db> {
-    pub(super) fn new() -> Self {
-        Self::default()
-    }
-
     pub(super) fn add_symbol(&mut self, symbol: ScopedSymbolId) {
         let new_symbol = self.symbol_states.push(SymbolState::undefined());
         debug_assert_eq!(symbol, new_symbol);

@@ -1,17 +1,15 @@
-//! Match [`TypeCheckDiagnostic`]s against [`Assertion`]s and produce test failure messages for any
+//! Match [`Diagnostic`]s against [`Assertion`]s and produce test failure messages for any
 //! mismatches.
 use crate::assertion::{Assertion, ErrorAssertion, InlineFileAssertions};
 use crate::db::Db;
 use crate::diagnostic::SortedDiagnostics;
 use colored::Colorize;
-use red_knot_python_semantic::types::TypeCheckDiagnostic;
+use ruff_db::diagnostic::{Diagnostic, DiagnosticAsStrError, DiagnosticId};
 use ruff_db::files::File;
 use ruff_db::source::{line_index, source_text, SourceText};
 use ruff_source_file::{LineIndex, OneIndexed};
-use ruff_text_size::Ranged;
 use std::cmp::Ordering;
 use std::ops::Range;
-use std::sync::Arc;
 
 #[derive(Debug, Default)]
 pub(super) struct FailuresByLine {
@@ -55,7 +53,7 @@ pub(super) fn match_file<T>(
     diagnostics: impl IntoIterator<Item = T>,
 ) -> Result<(), FailuresByLine>
 where
-    T: Diagnostic + Clone,
+    T: Diagnostic,
 {
     // Parse assertions from comments in the file, and get diagnostics from the file; both
     // ordered by line number.
@@ -126,22 +124,6 @@ where
     }
 }
 
-pub(super) trait Diagnostic: Ranged {
-    fn rule(&self) -> &str;
-
-    fn message(&self) -> &str;
-}
-
-impl Diagnostic for Arc<TypeCheckDiagnostic> {
-    fn rule(&self) -> &str {
-        self.as_ref().rule()
-    }
-
-    fn message(&self) -> &str {
-        self.as_ref().message()
-    }
-}
-
 trait Unmatched {
     fn unmatched(&self) -> String;
 }
@@ -164,7 +146,7 @@ fn maybe_add_undefined_reveal_clarification<T: Diagnostic>(
     diagnostic: &T,
     original: std::fmt::Arguments,
 ) -> String {
-    if diagnostic.rule() == "undefined-reveal" {
+    if diagnostic.id().is_lint_named("undefined-reveal") {
         format!(
             "{} add a `# revealed` assertion on this line (original diagnostic: {original})",
             "used built-in `reveal_type`:".yellow()
@@ -179,9 +161,14 @@ where
     T: Diagnostic,
 {
     fn unmatched(&self) -> String {
+        let id = self.id();
+        let id = id.as_str().unwrap_or_else(|error| match error {
+            DiagnosticAsStrError::Category { name, .. } => name,
+        });
+
         maybe_add_undefined_reveal_clarification(
             self,
-            format_args!(r#"[{}] "{}""#, self.rule(), self.message()),
+            format_args!(r#"[{id}] "{message}""#, message = self.message()),
         )
     }
 }
@@ -191,11 +178,26 @@ where
     T: Diagnostic,
 {
     fn unmatched_with_column(&self, column: OneIndexed) -> String {
+        let id = self.id();
+        let id = id.as_str().unwrap_or_else(|error| match error {
+            DiagnosticAsStrError::Category { name, .. } => name,
+        });
+
         maybe_add_undefined_reveal_clarification(
             self,
-            format_args!(r#"{column} [{}] "{}""#, self.rule(), self.message()),
+            format_args!(r#"{column} [{id}] "{message}""#, message = self.message()),
         )
     }
+}
+
+/// Discard `@Todo`-type metadata from expected types, which is not available
+/// when running in release mode.
+#[cfg(not(debug_assertions))]
+fn discard_todo_metadata(ty: &str) -> std::borrow::Cow<'_, str> {
+    static TODO_METADATA_REGEX: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"@Todo\([^)]*\)").unwrap());
+
+    TODO_METADATA_REGEX.replace_all(ty, "@Todo")
 }
 
 struct Matcher {
@@ -253,10 +255,15 @@ impl Matcher {
         }
     }
 
-    fn column<T: Ranged>(&self, ranged: &T) -> OneIndexed {
-        self.line_index
-            .source_location(ranged.start(), &self.source)
-            .column
+    fn column<T: Diagnostic>(&self, diagnostic: &T) -> OneIndexed {
+        diagnostic
+            .range()
+            .map(|range| {
+                self.line_index
+                    .source_location(range.start(), &self.source)
+                    .column
+            })
+            .unwrap_or(OneIndexed::from_zero_indexed(0))
     }
 
     /// Check if `assertion` matches any [`Diagnostic`]s in `unmatched`.
@@ -273,10 +280,11 @@ impl Matcher {
         match assertion {
             Assertion::Error(error) => {
                 let position = unmatched.iter().position(|diagnostic| {
-                    !error.rule.is_some_and(|rule| rule != diagnostic.rule())
-                        && !error
-                            .column
-                            .is_some_and(|col| col != self.column(*diagnostic))
+                    !error.rule.is_some_and(|rule| {
+                        !(diagnostic.id().is_lint_named(rule) || diagnostic.id().matches(rule))
+                    }) && !error
+                        .column
+                        .is_some_and(|col| col != self.column(*diagnostic))
                         && !error
                             .message_contains
                             .is_some_and(|needle| !diagnostic.message().contains(needle))
@@ -289,17 +297,20 @@ impl Matcher {
                 }
             }
             Assertion::Revealed(expected_type) => {
+                #[cfg(not(debug_assertions))]
+                let expected_type = discard_todo_metadata(&expected_type);
+
                 let mut matched_revealed_type = None;
                 let mut matched_undefined_reveal = None;
                 let expected_reveal_type_message = format!("Revealed type is `{expected_type}`");
                 for (index, diagnostic) in unmatched.iter().enumerate() {
                     if matched_revealed_type.is_none()
-                        && diagnostic.rule() == "revealed-type"
+                        && diagnostic.id() == DiagnosticId::RevealedType
                         && diagnostic.message() == expected_reveal_type_message
                     {
                         matched_revealed_type = Some(index);
                     } else if matched_undefined_reveal.is_none()
-                        && diagnostic.rule() == "undefined-reveal"
+                        && diagnostic.id().is_lint_named("undefined-reveal")
                     {
                         matched_undefined_reveal = Some(index);
                     }
@@ -323,54 +334,87 @@ impl Matcher {
 #[cfg(test)]
 mod tests {
     use super::FailuresByLine;
-    use ruff_db::files::system_path_to_file;
+    use ruff_db::diagnostic::{Diagnostic, DiagnosticId, Severity};
+    use ruff_db::files::{system_path_to_file, File};
     use ruff_db::system::{DbWithTestSystem, SystemPathBuf};
     use ruff_python_trivia::textwrap::dedent;
     use ruff_source_file::OneIndexed;
-    use ruff_text_size::{Ranged, TextRange};
+    use ruff_text_size::TextRange;
+    use std::borrow::Cow;
 
-    #[derive(Clone, Debug)]
-    struct TestDiagnostic {
-        rule: &'static str,
+    struct ExpectedDiagnostic {
+        id: DiagnosticId,
         message: &'static str,
         range: TextRange,
     }
 
-    impl TestDiagnostic {
-        fn new(rule: &'static str, message: &'static str, offset: usize) -> Self {
+    impl ExpectedDiagnostic {
+        fn new(id: DiagnosticId, message: &'static str, offset: usize) -> Self {
             let offset: u32 = offset.try_into().unwrap();
             Self {
-                rule,
+                id,
                 message,
                 range: TextRange::new(offset.into(), (offset + 1).into()),
             }
         }
-    }
 
-    impl super::Diagnostic for TestDiagnostic {
-        fn rule(&self) -> &str {
-            self.rule
-        }
-
-        fn message(&self) -> &str {
-            self.message
-        }
-    }
-
-    impl Ranged for TestDiagnostic {
-        fn range(&self) -> ruff_text_size::TextRange {
-            self.range
+        fn into_diagnostic(self, file: File) -> TestDiagnostic {
+            TestDiagnostic {
+                id: self.id,
+                message: self.message,
+                range: self.range,
+                file,
+            }
         }
     }
 
-    fn get_result(source: &str, diagnostics: Vec<TestDiagnostic>) -> Result<(), FailuresByLine> {
+    #[derive(Debug)]
+    struct TestDiagnostic {
+        id: DiagnosticId,
+        message: &'static str,
+        range: TextRange,
+        file: File,
+    }
+
+    impl Diagnostic for TestDiagnostic {
+        fn id(&self) -> DiagnosticId {
+            self.id
+        }
+
+        fn message(&self) -> Cow<str> {
+            self.message.into()
+        }
+
+        fn file(&self) -> File {
+            self.file
+        }
+
+        fn range(&self) -> Option<TextRange> {
+            Some(self.range)
+        }
+
+        fn severity(&self) -> Severity {
+            Severity::Error
+        }
+    }
+
+    fn get_result(
+        source: &str,
+        diagnostics: Vec<ExpectedDiagnostic>,
+    ) -> Result<(), FailuresByLine> {
         colored::control::set_override(false);
 
         let mut db = crate::db::Db::setup(SystemPathBuf::from("/src"));
         db.write_file("/src/test.py", source).unwrap();
         let file = system_path_to_file(&db, "/src/test.py").unwrap();
 
-        super::match_file(&db, file, diagnostics)
+        super::match_file(
+            &db,
+            file,
+            diagnostics
+                .into_iter()
+                .map(|diagnostic| diagnostic.into_diagnostic(file)),
+        )
     }
 
     fn assert_fail(result: Result<(), FailuresByLine>, messages: &[(usize, &[&str])]) {
@@ -403,8 +447,8 @@ mod tests {
     fn revealed_match() {
         let result = get_result(
             "x # revealed: Foo",
-            vec![TestDiagnostic::new(
-                "revealed-type",
+            vec![ExpectedDiagnostic::new(
+                DiagnosticId::RevealedType,
                 "Revealed type is `Foo`",
                 0,
             )],
@@ -417,8 +461,8 @@ mod tests {
     fn revealed_wrong_rule() {
         let result = get_result(
             "x # revealed: Foo",
-            vec![TestDiagnostic::new(
-                "not-revealed-type",
+            vec![ExpectedDiagnostic::new(
+                DiagnosticId::lint("not-revealed-type"),
                 "Revealed type is `Foo`",
                 0,
             )],
@@ -440,7 +484,11 @@ mod tests {
     fn revealed_wrong_message() {
         let result = get_result(
             "x # revealed: Foo",
-            vec![TestDiagnostic::new("revealed-type", "Something else", 0)],
+            vec![ExpectedDiagnostic::new(
+                DiagnosticId::RevealedType,
+                "Something else",
+                0,
+            )],
         );
 
         assert_fail(
@@ -467,8 +515,12 @@ mod tests {
         let result = get_result(
             "x # revealed: Foo",
             vec![
-                TestDiagnostic::new("revealed-type", "Revealed type is `Foo`", 0),
-                TestDiagnostic::new("undefined-reveal", "Doesn't matter", 0),
+                ExpectedDiagnostic::new(DiagnosticId::RevealedType, "Revealed type is `Foo`", 0),
+                ExpectedDiagnostic::new(
+                    DiagnosticId::lint("undefined-reveal"),
+                    "Doesn't matter",
+                    0,
+                ),
             ],
         );
 
@@ -479,7 +531,11 @@ mod tests {
     fn revealed_match_with_only_undefined() {
         let result = get_result(
             "x # revealed: Foo",
-            vec![TestDiagnostic::new("undefined-reveal", "Doesn't matter", 0)],
+            vec![ExpectedDiagnostic::new(
+                DiagnosticId::lint("undefined-reveal"),
+                "Doesn't matter",
+                0,
+            )],
         );
 
         assert_fail(result, &[(0, &["unmatched assertion: revealed: Foo"])]);
@@ -490,8 +546,12 @@ mod tests {
         let result = get_result(
             "x # revealed: Foo",
             vec![
-                TestDiagnostic::new("revealed-type", "Revealed type is `Bar`", 0),
-                TestDiagnostic::new("undefined-reveal", "Doesn't matter", 0),
+                ExpectedDiagnostic::new(DiagnosticId::RevealedType, "Revealed type is `Bar`", 0),
+                ExpectedDiagnostic::new(
+                    DiagnosticId::lint("undefined-reveal"),
+                    "Doesn't matter",
+                    0,
+                ),
             ],
         );
 
@@ -512,8 +572,16 @@ mod tests {
         let result = get_result(
             "reveal_type(1)",
             vec![
-                TestDiagnostic::new("undefined-reveal", "undefined reveal message", 0),
-                TestDiagnostic::new("revealed-type", "Revealed type is `Literal[1]`", 12),
+                ExpectedDiagnostic::new(
+                    DiagnosticId::lint("undefined-reveal"),
+                    "undefined reveal message",
+                    0,
+                ),
+                ExpectedDiagnostic::new(
+                    DiagnosticId::RevealedType,
+                    "Revealed type is `Literal[1]`",
+                    12,
+                ),
             ],
         );
 
@@ -535,8 +603,16 @@ mod tests {
         let result = get_result(
             "reveal_type(1) # error: [something-else]",
             vec![
-                TestDiagnostic::new("undefined-reveal", "undefined reveal message", 0),
-                TestDiagnostic::new("revealed-type", "Revealed type is `Literal[1]`", 12),
+                ExpectedDiagnostic::new(
+                    DiagnosticId::lint("undefined-reveal"),
+                    "undefined reveal message",
+                    0,
+                ),
+                ExpectedDiagnostic::new(
+                    DiagnosticId::RevealedType,
+                    "Revealed type is `Literal[1]`",
+                    12,
+                ),
             ],
         );
 
@@ -565,7 +641,11 @@ mod tests {
     fn error_match_rule() {
         let result = get_result(
             "x # error: [some-rule]",
-            vec![TestDiagnostic::new("some-rule", "Any message", 0)],
+            vec![ExpectedDiagnostic::new(
+                DiagnosticId::lint("some-rule"),
+                "Any message",
+                0,
+            )],
         );
 
         assert_ok(&result);
@@ -575,7 +655,11 @@ mod tests {
     fn error_wrong_rule() {
         let result = get_result(
             "x # error: [some-rule]",
-            vec![TestDiagnostic::new("anything", "Any message", 0)],
+            vec![ExpectedDiagnostic::new(
+                DiagnosticId::lint("anything"),
+                "Any message",
+                0,
+            )],
         );
 
         assert_fail(
@@ -594,7 +678,11 @@ mod tests {
     fn error_match_message() {
         let result = get_result(
             r#"x # error: "contains this""#,
-            vec![TestDiagnostic::new("anything", "message contains this", 0)],
+            vec![ExpectedDiagnostic::new(
+                DiagnosticId::lint("anything"),
+                "message contains this",
+                0,
+            )],
         );
 
         assert_ok(&result);
@@ -604,7 +692,11 @@ mod tests {
     fn error_wrong_message() {
         let result = get_result(
             r#"x # error: "contains this""#,
-            vec![TestDiagnostic::new("anything", "Any message", 0)],
+            vec![ExpectedDiagnostic::new(
+                DiagnosticId::lint("anything"),
+                "Any message",
+                0,
+            )],
         );
 
         assert_fail(
@@ -623,7 +715,11 @@ mod tests {
     fn error_match_column_and_rule() {
         let result = get_result(
             "x # error: 1 [some-rule]",
-            vec![TestDiagnostic::new("some-rule", "Any message", 0)],
+            vec![ExpectedDiagnostic::new(
+                DiagnosticId::lint("some-rule"),
+                "Any message",
+                0,
+            )],
         );
 
         assert_ok(&result);
@@ -633,7 +729,11 @@ mod tests {
     fn error_wrong_column() {
         let result = get_result(
             "x # error: 2 [rule]",
-            vec![TestDiagnostic::new("rule", "Any message", 0)],
+            vec![ExpectedDiagnostic::new(
+                DiagnosticId::lint("rule"),
+                "Any message",
+                0,
+            )],
         );
 
         assert_fail(
@@ -652,7 +752,11 @@ mod tests {
     fn error_match_column_and_message() {
         let result = get_result(
             r#"x # error: 1 "contains this""#,
-            vec![TestDiagnostic::new("anything", "message contains this", 0)],
+            vec![ExpectedDiagnostic::new(
+                DiagnosticId::lint("anything"),
+                "message contains this",
+                0,
+            )],
         );
 
         assert_ok(&result);
@@ -662,7 +766,11 @@ mod tests {
     fn error_match_rule_and_message() {
         let result = get_result(
             r#"x # error: [a-rule] "contains this""#,
-            vec![TestDiagnostic::new("a-rule", "message contains this", 0)],
+            vec![ExpectedDiagnostic::new(
+                DiagnosticId::lint("a-rule"),
+                "message contains this",
+                0,
+            )],
         );
 
         assert_ok(&result);
@@ -672,7 +780,11 @@ mod tests {
     fn error_match_all() {
         let result = get_result(
             r#"x # error: 1 [a-rule] "contains this""#,
-            vec![TestDiagnostic::new("a-rule", "message contains this", 0)],
+            vec![ExpectedDiagnostic::new(
+                DiagnosticId::lint("a-rule"),
+                "message contains this",
+                0,
+            )],
         );
 
         assert_ok(&result);
@@ -682,7 +794,11 @@ mod tests {
     fn error_match_all_wrong_column() {
         let result = get_result(
             r#"x # error: 2 [some-rule] "contains this""#,
-            vec![TestDiagnostic::new("some-rule", "message contains this", 0)],
+            vec![ExpectedDiagnostic::new(
+                DiagnosticId::lint("some-rule"),
+                "message contains this",
+                0,
+            )],
         );
 
         assert_fail(
@@ -701,8 +817,8 @@ mod tests {
     fn error_match_all_wrong_rule() {
         let result = get_result(
             r#"x # error: 1 [some-rule] "contains this""#,
-            vec![TestDiagnostic::new(
-                "other-rule",
+            vec![ExpectedDiagnostic::new(
+                DiagnosticId::lint("other-rule"),
                 "message contains this",
                 0,
             )],
@@ -724,7 +840,11 @@ mod tests {
     fn error_match_all_wrong_message() {
         let result = get_result(
             r#"x # error: 1 [some-rule] "contains this""#,
-            vec![TestDiagnostic::new("some-rule", "Any message", 0)],
+            vec![ExpectedDiagnostic::new(
+                DiagnosticId::lint("some-rule"),
+                "Any message",
+                0,
+            )],
         );
 
         assert_fail(
@@ -757,9 +877,9 @@ mod tests {
         let result = get_result(
             &source,
             vec![
-                TestDiagnostic::new("line-two", "msg", two),
-                TestDiagnostic::new("line-three", "msg", three),
-                TestDiagnostic::new("line-five", "msg", five),
+                ExpectedDiagnostic::new(DiagnosticId::lint("line-two"), "msg", two),
+                ExpectedDiagnostic::new(DiagnosticId::lint("line-three"), "msg", three),
+                ExpectedDiagnostic::new(DiagnosticId::lint("line-five"), "msg", five),
             ],
         );
 
@@ -788,8 +908,8 @@ mod tests {
         let result = get_result(
             &source,
             vec![
-                TestDiagnostic::new("line-one", "msg", one),
-                TestDiagnostic::new("line-two", "msg", two),
+                ExpectedDiagnostic::new(DiagnosticId::lint("line-one"), "msg", one),
+                ExpectedDiagnostic::new(DiagnosticId::lint("line-two"), "msg", two),
             ],
         );
 
@@ -809,8 +929,8 @@ mod tests {
         let result = get_result(
             &source,
             vec![
-                TestDiagnostic::new("one-rule", "msg", x),
-                TestDiagnostic::new("other-rule", "msg", x),
+                ExpectedDiagnostic::new(DiagnosticId::lint("one-rule"), "msg", x),
+                ExpectedDiagnostic::new(DiagnosticId::lint("other-rule"), "msg", x),
             ],
         );
 
@@ -830,8 +950,8 @@ mod tests {
         let result = get_result(
             &source,
             vec![
-                TestDiagnostic::new("one-rule", "msg", x),
-                TestDiagnostic::new("one-rule", "msg", x),
+                ExpectedDiagnostic::new(DiagnosticId::lint("one-rule"), "msg", x),
+                ExpectedDiagnostic::new(DiagnosticId::lint("one-rule"), "msg", x),
             ],
         );
 
@@ -851,9 +971,9 @@ mod tests {
         let result = get_result(
             &source,
             vec![
-                TestDiagnostic::new("one-rule", "msg", x),
-                TestDiagnostic::new("other-rule", "msg", x),
-                TestDiagnostic::new("third-rule", "msg", x),
+                ExpectedDiagnostic::new(DiagnosticId::lint("one-rule"), "msg", x),
+                ExpectedDiagnostic::new(DiagnosticId::lint("other-rule"), "msg", x),
+                ExpectedDiagnostic::new(DiagnosticId::lint("third-rule"), "msg", x),
             ],
         );
 
@@ -877,8 +997,12 @@ mod tests {
         let result = get_result(
             &source,
             vec![
-                TestDiagnostic::new("undefined-reveal", "msg", reveal),
-                TestDiagnostic::new("revealed-type", "Revealed type is `Literal[5]`", reveal),
+                ExpectedDiagnostic::new(DiagnosticId::lint("undefined-reveal"), "msg", reveal),
+                ExpectedDiagnostic::new(
+                    DiagnosticId::RevealedType,
+                    "Revealed type is `Literal[5]`",
+                    reveal,
+                ),
             ],
         );
 
@@ -891,7 +1015,11 @@ mod tests {
         let x = source.find('x').unwrap();
         let result = get_result(
             source,
-            vec![TestDiagnostic::new("some-rule", "some message", x)],
+            vec![ExpectedDiagnostic::new(
+                DiagnosticId::lint("some-rule"),
+                "some message",
+                x,
+            )],
         );
 
         assert_fail(
@@ -912,7 +1040,11 @@ mod tests {
         let x = source.find('x').unwrap();
         let result = get_result(
             source,
-            vec![TestDiagnostic::new("some-rule", "some message", x)],
+            vec![ExpectedDiagnostic::new(
+                DiagnosticId::lint("some-rule"),
+                "some message",
+                x,
+            )],
         );
 
         assert_fail(

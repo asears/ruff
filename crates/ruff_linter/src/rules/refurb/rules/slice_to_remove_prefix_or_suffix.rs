@@ -1,10 +1,11 @@
-use crate::{checkers::ast::Checker, settings::types::PythonVersion};
 use ruff_diagnostics::{AlwaysFixableViolation, Diagnostic, Edit, Fix};
-use ruff_macros::{derive_message_formats, violation};
+use ruff_macros::{derive_message_formats, ViolationMetadata};
 use ruff_python_ast as ast;
 use ruff_python_semantic::SemanticModel;
-use ruff_source_file::Locator;
 use ruff_text_size::Ranged;
+
+use crate::Locator;
+use crate::{checkers::ast::Checker, settings::types::PythonVersion};
 
 /// ## What it does
 /// Checks for the removal of a prefix or suffix from a string by assigning
@@ -34,9 +35,8 @@ use ruff_text_size::Ranged;
 /// ```python
 /// text = text.removeprefix("pre")
 /// ```
-#[violation]
-pub struct SliceToRemovePrefixOrSuffix {
-    string: String,
+#[derive(ViolationMetadata)]
+pub(crate) struct SliceToRemovePrefixOrSuffix {
     affix_kind: AffixKind,
     stmt_or_expression: StmtOrExpr,
 }
@@ -46,10 +46,10 @@ impl AlwaysFixableViolation for SliceToRemovePrefixOrSuffix {
     fn message(&self) -> String {
         match self.affix_kind {
             AffixKind::StartsWith => {
-                format!("Prefer `removeprefix` over conditionally replacing with slice.")
+                "Prefer `removeprefix` over conditionally replacing with slice.".to_string()
             }
             AffixKind::EndsWith => {
-                format!("Prefer `removesuffix` over conditionally replacing with slice.")
+                "Prefer `removesuffix` over conditionally replacing with slice.".to_string()
             }
         }
     }
@@ -79,7 +79,6 @@ pub(crate) fn slice_to_remove_affix_expr(checker: &mut Checker, if_expr: &ast::E
             let mut diagnostic = Diagnostic::new(
                 SliceToRemovePrefixOrSuffix {
                     affix_kind: kind,
-                    string: checker.locator().slice(text).to_string(),
                     stmt_or_expression: StmtOrExpr::Expression,
                 },
                 if_expr.range,
@@ -110,7 +109,6 @@ pub(crate) fn slice_to_remove_affix_stmt(checker: &mut Checker, if_stmt: &ast::S
             let mut diagnostic = Diagnostic::new(
                 SliceToRemovePrefixOrSuffix {
                     affix_kind: kind,
-                    string: checker.locator().slice(text).to_string(),
                     stmt_or_expression: StmtOrExpr::Statement,
                 },
                 if_stmt.range,

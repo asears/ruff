@@ -1,26 +1,25 @@
+use std::fmt::{Debug, Formatter};
+use std::iter::FusedIterator;
+
+use bitflags::bitflags;
+
 pub(crate) use extraneous_whitespace::*;
 pub(crate) use indentation::*;
 pub(crate) use missing_whitespace::*;
 pub(crate) use missing_whitespace_after_keyword::*;
 pub(crate) use missing_whitespace_around_operator::*;
 pub(crate) use redundant_backslash::*;
+use ruff_python_parser::{TokenKind, Tokens};
+use ruff_python_trivia::is_python_whitespace;
+use ruff_text_size::{Ranged, TextLen, TextRange, TextSize};
 pub(crate) use space_around_operator::*;
 pub(crate) use whitespace_around_keywords::*;
 pub(crate) use whitespace_around_named_parameter_equals::*;
 pub(crate) use whitespace_before_comment::*;
 pub(crate) use whitespace_before_parameters::*;
 
-use std::fmt::{Debug, Formatter};
-use std::iter::FusedIterator;
-
-use bitflags::bitflags;
-use ruff_text_size::{Ranged, TextLen, TextRange, TextSize};
-
-use ruff_python_parser::{TokenKind, Tokens};
-use ruff_python_trivia::is_python_whitespace;
-use ruff_source_file::Locator;
-
 use crate::rules::pycodestyle::helpers::is_non_logical_token;
+use crate::Locator;
 
 mod extraneous_whitespace;
 mod indentation;
@@ -38,18 +37,17 @@ bitflags! {
     #[derive(Default, Eq, PartialEq, Clone, Copy, Debug)]
     pub(crate) struct TokenFlags: u8 {
         /// Whether the logical line contains an operator.
-        const OPERATOR = 0b0000_0001;
+        const OPERATOR = 1 << 0;
         /// Whether the logical line contains a bracket.
-        const BRACKET = 0b0000_0010;
+        const BRACKET = 1 << 1;
         /// Whether the logical line contains a punctuation mark.
-        const PUNCTUATION = 0b0000_0100;
+        const PUNCTUATION = 1 << 2;
         /// Whether the logical line contains a keyword.
-        const KEYWORD = 0b0000_1000;
+        const KEYWORD = 1 << 3;
         /// Whether the logical line contains a comment.
-        const COMMENT = 0b0001_0000;
-
+        const COMMENT = 1 << 4;
         /// Whether the logical line contains any non trivia token (no comment, newline, or in/dedent)
-        const NON_TRIVIA = 0b0010_0000;
+        const NON_TRIVIA = 1 << 5;
     }
 }
 
@@ -579,7 +577,8 @@ impl TypeParamsState {
 #[cfg(test)]
 mod tests {
     use ruff_python_parser::parse_module;
-    use ruff_source_file::Locator;
+
+    use crate::Locator;
 
     use super::LogicalLines;
 
